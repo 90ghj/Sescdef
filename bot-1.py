@@ -1,7 +1,8 @@
 """
 Телеграм-бот модерации чата по правилам.
-Автоматически: п.1 мат, п.2 оскорбления, п.3 флуд, п.4 реклама/спам, п.5 политика, п.7 (по ссылкам на 18+).
-Вручную: /mute, /ban, /unmute, /unban, /warn_media (п.6), /rules.
+Автоматически: п.1 мат, п.2 оскорбления, п.3 флуд, п.5 политика, п.7 (по ссылкам на 18+).
+Вручную (п.4 реклама, п.6 медиа и всё остальное): /mute, /ban, /unmute, /unban, /mods, /rules
+или быстрые слова без слеша: мут, размут, бан, разбан, модеры, правила.
 Владелец (п.8) может всё и без причины. Модеры (п.9) — только с номером пункта правил.
 """
 import asyncio
@@ -54,12 +55,10 @@ INSULTS = [r"\bдебил", r"\bидиот", r"\bтуп(ой|ая|ица)", r"\b
            r"\bчмо\b", r"\bлох\b", r"\bкретин", r"\bдегенерат", r"\bшлюх"]
 POLITICS = [r"путин", r"зеленск", r"навальн", r"байден", r"трамп", r"\bвыбор(ы|ах)\b",
             r"госдум", r"\bсво\b", r"мобилизац", r"оппозици", r"\bкремл"]
-ADS = [r"https?://", r"t\.me/", r"@\w+bot\b", r"\bподпис(ыв)?айтесь\b", r"\bзаработ(ок|ай)",
-       r"\bкупи(те)?\b", r"\bскидк", r"\bпромокод", r"\bкрипт", r"\bказино"]
 PORN = [r"porn", r"xvideos", r"pornhub", r"onlyfans", r"\bпорн", r"xxx"]
 
 def _compile(lst): return re.compile("|".join(lst), re.IGNORECASE)
-RE_PROF, RE_INS, RE_POL, RE_ADS, RE_PORN = map(_compile, (PROFANITY, INSULTS, POLITICS, ADS, PORN))
+RE_PROF, RE_INS, RE_POL, RE_PORN = map(_compile, (PROFANITY, INSULTS, POLITICS, PORN))
 
 # Флуд: больше FLOOD_COUNT сообщений за FLOOD_WINDOW секунд или 3 одинаковых подряд
 FLOOD_COUNT, FLOOD_WINDOW = 6, 10
@@ -67,16 +66,20 @@ history: dict[tuple, deque] = defaultdict(lambda: deque(maxlen=20))      # (chat
 porn_strikes: dict[tuple, int] = defaultdict(int)
 
 
-def load_mods() -> set[int]:
+def load_mods() -> dict[int, str]:
+    """{id: имя}"""
     try:
         with open(MODERATORS_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
+            data = json.load(f)
     except FileNotFoundError:
-        return set()
+        return {}
+    if isinstance(data, list):                       # старый формат — просто список ID
+        return {int(i): str(i) for i in data}
+    return {int(k): v for k, v in data.items()}
 
-def save_mods(mods: set[int]):
+def save_mods(mods: dict[int, str]):
     with open(MODERATORS_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(mods), f)
+        json.dump(mods, f, ensure_ascii=False)
 
 MODS = load_mods()
 
@@ -130,11 +133,22 @@ async def cmd_rules(msg: Message):
 async def cmd_mods(msg: Message, command: CommandObject):
     if not is_owner(msg.from_user.id) or not msg.reply_to_message:
         return await msg.reply("Только владелец, ответом на сообщение человека.")
-    uid = msg.reply_to_message.from_user.id
-    (MODS.add if command.command == "addmod" else MODS.discard)(uid)
+    target = msg.reply_to_message.from_user
+    if command.command == "addmod":
+        MODS[target.id] = target.full_name
+    else:
+        MODS.pop(target.id, None)
     save_mods(MODS)
-    log_action(f"OWNER {command.command} {uid}")
+    log_action(f"OWNER {command.command} {target.id}")
     await msg.reply("✅ Готово.")
+
+@dp.message(Command("mods"))
+async def cmd_mods_list(msg: Message):
+    lines = [f'👑 <a href="tg://user?id={OWNER_ID}">Владелец</a>']
+    lines += [f'🛡 <a href="tg://user?id={uid}">{name}</a>' for uid, name in MODS.items()]
+    if not MODS:
+        lines.append("Модераторов пока нет.")
+    await msg.answer("Администрация чата:\n" + "\n".join(lines), parse_mode="HTML")
 
 def target_and_args(msg: Message, command: CommandObject):
     if not msg.reply_to_message:
@@ -202,6 +216,22 @@ async def cmd_forgive(msg: Message, command: CommandObject):
     await msg.reply("✅ Готово.")
 
 
+# ---------------- Быстрые команды без слеша ----------------
+QUICK = {"мут": "mute", "размут": "unmute", "бан": "ban", "разбан": "unban",
+         "модеры": "mods", "правила": "rules"}
+QUICK_HANDLERS = {"mute": cmd_punish, "ban": cmd_punish, "unmute": cmd_forgive, "unban": cmd_forgive}
+
+@dp.message(F.text.regexp(r"(?i)^(мут|размут|бан|разбан|модеры|правила)(\s|$)"))
+async def quick_command(msg: Message):
+    word, _, args = msg.text.strip().partition(" ")
+    cmd = QUICK[word.lower()]
+    if cmd == "rules":
+        return await cmd_rules(msg)
+    if cmd == "mods":
+        return await cmd_mods_list(msg)
+    await QUICK_HANDLERS[cmd](msg, CommandObject(prefix="", command=cmd, args=args.strip() or None))
+
+
 # ---------------- Автомодерация ----------------
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def auto_moderate(msg: Message):
@@ -222,8 +252,6 @@ async def auto_moderate(msg: Message):
             log_action(f"AUTO rule 7 repeat: BAN {user.id}")
             return await msg.answer(f"⛔ {user.mention_html()} забанен (п.7, повтор).", parse_mode="HTML")
         return await punish(msg, 7)
-    if RE_ADS.search(text) or msg.forward_origin and msg.forward_origin.type == "channel":
-        return await punish(msg, 4)
     if RE_POL.search(text):
         # удаляем последние сообщения пользователя про политику
         ids = [mid for _, t, mid in h if RE_POL.search(t)]
