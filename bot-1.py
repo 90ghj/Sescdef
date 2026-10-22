@@ -83,6 +83,26 @@ def save_mods(mods: dict[int, str]):
 
 MODS = load_mods()
 
+# Муты, выданные владельцем: модеры не могут их снять или перебить. {"chat:user": until_ts}
+OWNER_MUTES_FILE = "owner_mutes.json"
+try:
+    with open(OWNER_MUTES_FILE, encoding="utf-8") as f:
+        OWNER_MUTES: dict[str, float] = json.load(f)
+except FileNotFoundError:
+    OWNER_MUTES = {}
+
+def set_owner_mute(chat_id, user_id, until: float | None):
+    key = f"{chat_id}:{user_id}"
+    if until:
+        OWNER_MUTES[key] = until
+    else:
+        OWNER_MUTES.pop(key, None)
+    with open(OWNER_MUTES_FILE, "w", encoding="utf-8") as f:
+        json.dump(OWNER_MUTES, f)
+
+def owner_muted(chat_id, user_id) -> bool:
+    return OWNER_MUTES.get(f"{chat_id}:{user_id}", 0) > time.time()
+
 def log_action(text: str):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}"
     logging.info(line)
@@ -188,12 +208,16 @@ async def cmd_punish(msg: Message, command: CommandObject):
         if rule not in RULE_DURATION:
             return await msg.reply("❌ П.9: укажи номер нарушенного пункта (1–7), например /mute 3.")
         sec, reason = RULE_DURATION[rule], f"п.{rule}"
+        if owner_muted(msg.chat.id, target.id):
+            return await msg.reply("❌ Этого человека замутил владелец — менять его мут нельзя.")
     if rule == 7:
         porn_strikes[(msg.chat.id, target.id)] += 1
     if rule in (5, 6, 7):
         try: await msg.reply_to_message.delete()
         except Exception: pass
     await mute(msg.chat.id, target.id, sec)
+    if is_owner(actor.id):
+        set_owner_mute(msg.chat.id, target.id, time.time() + sec)
     log_action(f"{'OWNER' if is_owner(actor.id) else 'MOD'} {actor.id} MUTE {target.id} {fmt(sec)} {reason}")
     await msg.answer(f"🔇 {target.mention_html()} — мут на {fmt(sec)} ({reason}).", parse_mode="HTML")
 
@@ -211,7 +235,10 @@ async def cmd_forgive(msg: Message, command: CommandObject):
     if command.command == "unban":
         await bot.unban_chat_member(msg.chat.id, uid, only_if_banned=True)
     else:
+        if owner_muted(msg.chat.id, uid) and not is_owner(msg.from_user.id):
+            return await msg.reply("❌ Этого человека замутил владелец — размутить может только он.")
         await unmute(msg.chat.id, uid)
+        set_owner_mute(msg.chat.id, uid, None)
     log_action(f"{msg.from_user.id} {command.command.upper()} {uid}")
     await msg.reply("✅ Готово.")
 
